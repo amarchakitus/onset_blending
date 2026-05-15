@@ -59,7 +59,7 @@ Notes
 --gt_path
     Path to the historical ground truth wide pkl. Simultaneously overrides:
       - input.gt_path  in the clim spec     (imd_clim_mok_date_2026.yml)
-      - ground_truth_wide_rds in the combine spec (combine_template_*_2026.yml)
+      - input.ground_truth_wide_rds in the combine spec (combine_template_*_2026.yml)
     Both fields must point to the same file, so a single arg controls both.
 
 --skip_to N
@@ -110,8 +110,10 @@ def write_patched_spec(base_spec_id, spec_type, patches):
     Load specs/<spec_type>/<base_spec_id>.yml, apply nested key patches,
     write to specs/<spec_type>/<base_spec_id>_op.yml, and return the new spec_id.
 
-    patches is a list of (dotted_key, value) tuples, e.g.:
+    patches is a list of (dotted_key, value) tuples for existing fields, e.g.:
         [("input.nc_folder", "/new/path"), ("input.gt_path", "/other/path")]
+    Numeric path parts index into lists, e.g.:
+        [("forecasts.aifs.sources.0.file", "/new/path")]
     """
     src_path = os.path.join("specs", spec_type, f"{base_spec_id}.yml")
     if not os.path.exists(src_path):
@@ -124,10 +126,19 @@ def write_patched_spec(base_spec_id, spec_type, patches):
         keys = dotted_key.split(".")
         node = spec
         for k in keys[:-1]:
-            if k not in node:
-                node[k] = {}
-            node = node[k]
-        node[keys[-1]] = value
+            if isinstance(node, list):
+                node = node[int(k)]
+            else:
+                if k not in node:
+                    raise KeyError(f"Cannot patch missing key '{dotted_key}' in {src_path}")
+                node = node[k]
+        last_key = keys[-1]
+        if isinstance(node, list):
+            node[int(last_key)] = value
+        else:
+            if last_key not in node:
+                raise KeyError(f"Cannot patch missing key '{dotted_key}' in {src_path}")
+            node[last_key] = value
 
     new_spec_id = f"{base_spec_id}_op"
     dst_path = os.path.join("specs", spec_type, f"{new_spec_id}.yml")
@@ -252,7 +263,7 @@ def main():
                              "in the aifs_ens spec yml. Takes priority over --aifs_ens_nc_folder.")
     parser.add_argument("--gt_path", default=None,
                         help="Path to historical ground truth wide pkl. Overrides "
-                             "input.gt_path in the clim spec AND ground_truth_wide_rds "
+                             "input.gt_path in the clim spec AND input.ground_truth_wide_rds "
                              "in the combine spec (both must point to the same file)")
 
     # ── Optional ─────────────────────────────────────────────────────────
@@ -275,8 +286,13 @@ def main():
     map_out    = args.map_output_path or os.path.join("predict", "output", year)
     date_compact = issue_date.replace("-", "")
 
-    os.makedirs(work_dir, exist_ok=True)
-    os.makedirs(map_out,  exist_ok=True)
+    TOTAL = 8
+    if not 1 <= args.skip_to <= TOTAL:
+        abort(f"--skip_to must be between 1 and {TOTAL}; got {args.skip_to}.")
+
+    if not args.dry_run:
+        os.makedirs(work_dir, exist_ok=True)
+        os.makedirs(map_out,  exist_ok=True)
 
     # ── Patch specs where overrides are provided ──────────────────────────
     aifs_spec     = args.aifs_spec
@@ -310,14 +326,30 @@ def main():
             [("input.nc_folder", args.aifs_ens_nc_folder)]
         )
 
+    combine_patches = []
     if args.gt_path:
         clim_spec = write_patched_spec(
             args.clim_spec, "raw_data",
             [("input.gt_path", args.gt_path)]
         )
+        combine_patches.append(("input.ground_truth_wide_rds", args.gt_path))
+
+    # If raw-data specs were patched to _op ids, their output filenames also
+    # change. Keep the combine spec pointed at the files stage 1/2 actually write.
+    if aifs_spec != args.aifs_spec:
+        combine_patches.append((
+            "forecasts.aifs.sources.0.file",
+            os.path.join(work_dir, f"{aifs_spec}_wide.pkl"),
+        ))
+    if aifs_ens_spec != args.aifs_ens_spec:
+        combine_patches.append((
+            "forecasts.aifs_ens.sources.0.file",
+            os.path.join(work_dir, f"{aifs_ens_spec}_wide.pkl"),
+        ))
+
+    if combine_patches:
         combine_spec = write_patched_spec(
-            args.combine_spec, "combine",
-            [("ground_truth_wide_rds", args.gt_path)]
+            args.combine_spec, "combine", combine_patches
         )
 
     # Patch connect_spec input_rds to match the _op combine output basename.
@@ -331,33 +363,30 @@ def main():
     )
 
     # ── Expected output paths ─────────────────────────────────────────────
-    aifs_pkl     = os.path.join(work_dir, f"aifs_{year}_wide.pkl")
-    aifs_ens_pkl = os.path.join(work_dir, f"aifs_ens_{year}_wide.pkl")
+    aifs_pkl     = os.path.join(work_dir, f"{aifs_spec}_wide.pkl")
+    aifs_ens_pkl = os.path.join(work_dir, f"{aifs_ens_spec}_wide.pkl")
     connect_pkl  = args.blend_input
     preds_pkl    = os.path.join(work_dir, f"{args.blend_model}_global_year{year}_preds.pkl")
     export_csv   = os.path.join(work_dir, f"blend_output_summary_{date_compact}.csv")
 
-    TOTAL = 8
-
     steps = [
-        (1, "Process aifs nc files", [
-            sys.executable,
-            "python/pipelines/prepare_data/1_process_raw_nc_files.py",
-            "--spec_id", aifs_spec,
-        ], aifs_pkl),
-
-        (2, "Process aifs_ens nc files", [
-            sys.executable,
-            "python/pipelines/prepare_data/1_process_raw_nc_files.py",
-            "--spec_id", aifs_ens_spec,
-        ], aifs_ens_pkl),
-
-        (3, "Build climatology", [
+        (1, "Build climatology", [
             sys.executable,
             "python/pipelines/prepare_data/2_build_climatology.py",
             "--spec_id", clim_spec,
         ], None),
 
+        (2, "Process aifs nc files", [
+            sys.executable,
+            "python/pipelines/prepare_data/1_process_raw_nc_files.py",
+            "--spec_id", aifs_spec,
+        ], aifs_pkl),
+
+        (3, "Process aifs_ens nc files", [
+            sys.executable,
+            "python/pipelines/prepare_data/1_process_raw_nc_files.py",
+            "--spec_id", aifs_ens_spec,
+        ], aifs_ens_pkl),
         (4, "Combine datasets", [
             sys.executable,
             "python/pipelines/prepare_data/3_combine_datasets.py",
@@ -367,7 +396,7 @@ def main():
         (5, "Connect/prepare pipeline input", [
             sys.executable,
             "python/pipelines/blending_process/0_connect_prepare_data_to_2025_pipeline.py",
-            "--spec_id", args.connect_spec,
+            "--spec_id", connect_spec,
         ], connect_pkl),
 
         (6, "Apply blend model", [

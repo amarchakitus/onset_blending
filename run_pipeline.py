@@ -1,0 +1,176 @@
+import argparse
+import subprocess
+import datetime
+from pathlib import Path
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format=(
+        "%(asctime)s - %(levelname)s - %(name)s - %(pathname)s:%(lineno)d - %(message)s"
+    ),
+)
+
+REPO_BASE = Path(__file__).parent.parent.parent.parent
+TARGET_WORK_DIR = Path(__file__).parent
+
+ALLOWED_DELETE_EXT = {".csv", ".nc", ".pkl", ".png"}
+
+KEEP_F_NAMES = ["imd_clim_mok_date_clim_issue.pkl",
+                "imd_clim_mok_date_clim_unc_issue.pkl"]
+
+def move_and_rename_files(src, dest, f_dict):
+    for f_name, rename in f_dict.items():
+        expected_path = src / f_name
+        if not expected_path.exists():
+            logging.error(f"Expected output file {expected_path} does not exist.")
+            raise FileNotFoundError(
+                f"Expected output file {expected_path} does not exist. Check the step's logs above for errors."
+            )
+        else:
+            new_path = dest / rename
+            expected_path.rename(new_path)
+            logging.info(f"Moved and renamed {expected_path} to {new_path}")
+
+def delete_all_files_in_dir(dir_path):
+    for f in dir_path.glob("*"):
+        if f.is_file() and f.suffix in ALLOWED_DELETE_EXT:
+            if f.name in KEEP_F_NAMES:
+                logging.info(f"Keeping file {f} as it is in the keep list.")
+                continue
+            else:
+                f.unlink()
+                logging.info(f"Deleted file {f}")
+
+def ensure_all_paths_exist(paths):
+    """Return true if all paths exist, false otherwise."""
+    return all(path.exists() for path in paths)
+
+def run_blending_pipeline(date_f, ensemble_model, deterministic_model, debug=False, skip_to=None):
+
+    date = datetime.datetime.strptime(date_f, "%Y%m%dT%H")
+    issue_date_f = date.strftime("%Y-%m-%d")
+    year = date.year
+
+    py_script_path = TARGET_WORK_DIR / "predict" / "run_operational_pipeline.py"
+    expected_out_dir = TARGET_WORK_DIR / "Monsoon_Data" / "Processed_Data" / "2026"
+
+    if deterministic_model == "AIFS":
+        tp_fname = f"tp_0p25_{date_f}.nc"
+        aifs_tp_dir = REPO_BASE / "AIFS" / "output" / "ethiopia" / "AIFS" / "tp"
+        aifs_nc_file = aifs_tp_dir / tp_fname
+        if ensemble_model == "AIFS_ENS":
+            clim_exists = ensure_all_paths_exist([expected_out_dir / f for f in KEEP_F_NAMES])
+            if clim_exists and skip_to is None:
+                logging.info("Climatology files already exist. Skipping.")
+                skip_to = 2
+            if not clim_exists:
+                logging.warning("Climatology files do not exist. Running full pipeline.")
+
+            aifs_tp_dir = REPO_BASE / "AIFS" / "output" / "ethiopia" / "AIFS_ENS" / "tp"
+            aifs_ens_nc_file = aifs_tp_dir / tp_fname
+            args_dict = {
+                "--year": f"{year}",
+                "--issue_date": issue_date_f,
+                "--aifs_spec": "aifs_2026",
+                "--aifs_ens_spec": "aifs_ens_2026",
+                "--clim_spec": "imd_clim_mok_date_2026",
+                "--combine_spec": "combine_template_clim_mok_date_2026",
+                "--connect_spec": "connect_clim_mok_date_2026",
+                "--blend_spec": "cv_models_clim_mok_date_2026",
+                "--coef_dir":" Monsoon_Data/results/wet_spell_aifs_aifs_ens",
+                "--coef_tag": "clim_mok_date_2022_year2022",
+                "--blend_input": "Monsoon_Data/Processed_Data/2026/cv_data_clim_mok_date_new_pipeline_2026.pkl",
+                "--work_dir": "Monsoon_Data/Processed_Data/2026",
+                "--aifs_nc_file": f"{aifs_nc_file}",
+                "--aifs_ens_nc_file": f"{aifs_ens_nc_file}",
+                "--gt_path": "Monsoon_Data/Processed_Data/Models/wet_spell/imd_clim_mok_date_wide.pkl",
+                }
+            if skip_to is not None and skip_to > 1:
+                logging.info(f"Skipping to step {skip_to} in the pipeline")
+                args_dict["--skip_to"] = str(skip_to)
+
+        else:
+            raise ValueError(f"Ensemble model {ensemble_model} not supported with AIFS.")
+    else:
+        raise ValueError(f"Deterministic model {deterministic_model} not supported.")
+
+    cmd = ["python", str(py_script_path)]
+    for k, v in args_dict.items():
+        cmd.extend([k, v])
+    
+    logging.info(f"Running command: {' '.join(cmd)}")
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Command failed with error: {e}")
+        raise RuntimeError(f"Pipeline failed at step with command: {' '.join(cmd)}") from e
+
+    file_name_date_f = date.strftime("%Y%m%d")
+
+    keep_f_names = {
+        f"blend_output_summary_{file_name_date_f}.csv": f"blend_output_summary_{date_f}.csv",
+        f"blended_model_global_year{year}_preds.csv": f"blend_output_{date_f}.csv",
+    }
+
+    expected_out_dir_maps = TARGET_WORK_DIR / "predict" / "output" / "2026" / "maps"
+    keep_f_names_maps = {
+        f"map_max_period_{issue_date_f}.png": f"map_max_period_{date_f}.png",
+        f"prob_weeks1-4_{issue_date_f}.png": f"prob_weeks1-4_{date_f}.png",
+        f"max_period_index_{file_name_date_f}.nc": f"max_period_index_{date_f}.nc",
+        f"weekly_probs_{file_name_date_f}.nc": f"weekly_probs_{date_f}.nc",
+    }
+
+    final_out_dir = REPO_BASE / "blend" / "output" / "ethiopia2026" / date_f / f"{deterministic_model}_{ensemble_model}"
+    final_out_dir.mkdir(parents=True, exist_ok=True)
+
+    move_and_rename_files(expected_out_dir, final_out_dir, keep_f_names)
+    move_and_rename_files(expected_out_dir_maps, final_out_dir, keep_f_names_maps)
+
+    if not debug:
+        delete_all_files_in_dir(expected_out_dir)
+        delete_all_files_in_dir(expected_out_dir_maps)
+
+def main():
+    parser = argparse.ArgumentParser(description="Run the Ethiopia 2026 pipeline.")
+    parser.add_argument(
+        "--date",
+        type=str,
+        help="The date for which to run the pipeline. Format: YYYYMMDDTHH",
+    )
+
+    parser.add_argument(
+        "--ensemble_model",
+        type=str,
+        help="The ensemble model to blend.",
+    )
+    parser.add_argument(
+        "--deterministic_model",
+        type=str,
+        help="The deterministic model to blend.",
+    )
+
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+        help="Enable debug mode.",
+    )
+
+    parser.add_argument(
+        "--skip_to",
+        type=int,
+        default=None,
+        help="Skip to a specific step in the pipeline for debugging.",
+    )
+
+    args = parser.parse_args()
+    date_f = args.date
+    ensemble_model = args.ensemble_model
+    deterministic_model = args.deterministic_model
+    debug = args.debug
+    skip_to = args.skip_to
+    run_blending_pipeline(date_f, ensemble_model, deterministic_model, debug, skip_to)
+
+if __name__ == "__main__":
+    main()

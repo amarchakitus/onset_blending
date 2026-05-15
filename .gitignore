@@ -140,3 +140,5 @@ nohup.out
 # PBS/SLURM job outputs
 *.o[0-9]*
 *.e[0-9]*
+
+**/shapefile/**

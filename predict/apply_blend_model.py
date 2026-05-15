@@ -1,5 +1,6 @@
 import os
 import sys
+from pathlib import Path
 # --- MODIFICATION FOR SUBFOLDER SUPPORT ---
 # Identify the repository root (one level up from this script's directory)
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
@@ -269,7 +270,9 @@ def main():
 
     # ── Paths ──────────────────────────────────────────────────────────
     coef_dir = args.coef_dir or "Monsoon_Data/results/2025_model_evaluation"
+    coef_dir = coef_dir.strip()
     out_dir  = args.out_dir  or os.path.join(coef_dir, "per_year")
+    out_dir  = out_dir.strip()
     os.makedirs(out_dir, exist_ok=True)
 
     if args.coef_tag:                                                         # ← NEW
@@ -278,7 +281,7 @@ def main():
     else:
         coef_filename = f"coefs_{args.model}_{args.method}{output_tag}_year{args.year}.pkl"
     coef_path     = os.path.join(coef_dir, coef_filename)
-    print(f"\nLoading coefs from: {coef_path}")
+    print(f"\nLoading coefs from: {Path(coef_path).resolve()}")
 
     # ── Load coefficients ─────────────────────────────────────────────
     # ← NEW: load_coefs now returns a dict bundle instead of a bare DataFrame
